@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS vendas (
+    id INT NOT NULL AUTO_INCREMENT,
+    codigo VARCHAR(20) NOT NULL UNIQUE,
+    veiculo_id INT NOT NULL,
+    veiculo_placa VARCHAR(10) NOT NULL,
+    cliente_id INT NOT NULL,
+    cliente_cpf VARCHAR(14) NOT NULL,
+    data_venda TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    preco DECIMAL(10, 2) NOT NULL,
+    status ENUM('AGUARDANDO_PAGAMENTO', 'CANCELADA', 'PAGAMENTO_CONFIRMADO') NOT NULL DEFAULT 'AGUARDANDO_PAGAMENTO',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    INDEX idx_vendas_veiculo_status (veiculo_placa, status)
+);

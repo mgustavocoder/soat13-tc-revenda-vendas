@@ -1,0 +1,22 @@
+{
+  "name": "soat13-tc-revenda-vendas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Microserviço independente de vendas",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "express-xss-sanitizer": "^2.0.1",
+    "mysql2": "^3.15.1"
+  }
+}
