@@ -30,7 +30,8 @@ services:
       DB_USER: root
       DB_PASSWORD: ${DB_PASSWORD:-root}
       CLIENTES_SERVICE_URL: ${CLIENTES_SERVICE_URL:-http://host.docker.internal:3001}
-      VEICULOS_SERVICE_URL: ${VEICULOS_SERVICE_URL:-http://host.docker.internal:3002}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SQS_VENDAS_EVENTOS_URL: ${SQS_VENDAS_EVENTOS_URL:-}
     ports:
       - "${VENDAS_PORT:-3003}:3003"
     depends_on:

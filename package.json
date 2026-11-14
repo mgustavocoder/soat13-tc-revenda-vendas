@@ -8,10 +8,10 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
-    "test": "node --test",
-    "worker": "node src/worker.js"
+    "start": "node src/infrastructure/api/server.js",
+    "dev": "node --watch src/infrastructure/api/server.js",
+    "worker": "node src/infrastructure/messaging/worker.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1169.0",
