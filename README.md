@@ -7,6 +7,8 @@ Não compartilha código, banco, volume ou rede Docker com os outros serviços.
 
 As colunas `cliente_id` e `veiculo_id` guardam somente os identificadores recebidos por API; não há chaves estrangeiras ou conexão com os bancos dos outros serviços.
 
+Visão geral do sistema (AWS, Clean Architecture e saga): [documentação de arquitetura (PDF)](https://github.com/mgustavocoder/soat13-tc-revenda-infra-k8s/blob/main/docs/arquitetura-seguranca-saga.pdf).
+
 ## Executar
 
 ```bash
