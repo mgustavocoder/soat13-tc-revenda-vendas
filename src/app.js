@@ -1,8 +1,10 @@
 import { randomBytes } from 'node:crypto'
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs'
 import cors from 'cors'
 import express from 'express'
 import { xss } from 'express-xss-sanitizer'
 import { createPool } from 'mysql2/promise'
+import { createSalesOperations } from './sales-operations.js'
 
 const normalizePlaca = (placa) => String(placa || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
 const isValidPlaca = (placa) => /^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$/.test(placa)
@@ -22,6 +24,8 @@ const createApp = ({
   }),
   clientesBaseUrl = process.env.CLIENTES_SERVICE_URL || 'http://localhost:3001',
   veiculosBaseUrl = process.env.VEICULOS_SERVICE_URL || 'http://localhost:3002',
+  sqsClient = new SQSClient({ region: process.env.AWS_REGION || 'us-east-1' }),
+  queueUrl = process.env.SQS_QUEUE_URL,
   fetchImpl = globalThis.fetch
 } = {}) => {
   const app = express()
@@ -30,58 +34,61 @@ const createApp = ({
   app.use(xss())
   app.disable('x-powered-by')
 
-  const requestService = async (baseUrl, path, options = {}) => {
-    let response
+  const operations = createSalesOperations({
+    db,
+    clientesBaseUrl,
+    veiculosBaseUrl,
+    fetchImpl
+  })
+
+  const enqueueOperation = async (tipo, codigo) => {
+    if (!queueUrl) {
+      const error = new Error('Fila de operações não configurada.')
+      error.status = 503
+      throw error
+    }
+
     try {
-      response = await fetchImpl(`${baseUrl.replace(/\/$/, '')}${path}`, options)
+      return await sqsClient.send(new SendMessageCommand({
+        QueueUrl: queueUrl,
+        MessageBody: JSON.stringify({ tipo, codigo })
+      }))
     } catch (cause) {
-      const error = new Error('Serviço dependente indisponível.')
+      console.error(`Falha ao enfileirar a operação ${tipo}:`, cause)
+      const error = new Error('Fila de operações indisponível.')
       error.status = 503
       error.cause = cause
       throw error
     }
-
-    let body
-    try {
-      body = await response.json()
-    } catch (cause) {
-      const error = new Error('Resposta inválida de serviço dependente.')
-      error.status = 502
-      error.cause = cause
-      throw error
-    }
-    if (!response.ok) {
-      const error = new Error(body.message || 'Falha ao consultar serviço dependente.')
-      error.status = [400, 404, 409].includes(response.status) ? response.status : 502
-      throw error
-    }
-    return body
-  }
-
-  const getVenda = async (codigo) => {
-    const [rows] = await db.execute(
-      'SELECT id, codigo, veiculo_id, veiculo_placa, cliente_id, cliente_cpf, data_venda, preco, status FROM vendas WHERE codigo = ? LIMIT 1',
-      [codigo]
-    )
-    return rows[0]
   }
 
   const toPublicSale = (venda) => ({
     codigo: venda.codigo,
     veiculoPlaca: venda.veiculo_placa,
     clienteCpf: venda.cliente_cpf,
-    preco: Number(venda.preco),
+    preco: venda.preco == null ? null : Number(venda.preco),
     dataVenda: venda.data_venda,
-    status: venda.status
+    status: venda.status,
+    ...(venda.last_error ? { erro: venda.last_error } : {})
   })
 
   app.get('/api/health', (req, res) => res.json({ status: 'healthy' }))
 
   app.get('/api/vendas', async (req, res) => {
     const [rows] = await db.execute(
-      'SELECT id, codigo, veiculo_id, veiculo_placa, cliente_id, cliente_cpf, data_venda, preco, status FROM vendas ORDER BY id'
+      'SELECT id, codigo, veiculo_id, veiculo_placa, cliente_id, cliente_cpf, data_venda, preco, status, last_error FROM vendas ORDER BY id'
     )
     return res.status(200).json(rows.map(toPublicSale))
+  })
+
+  app.get('/api/vendas/:codigo', async (req, res) => {
+    const codigo = String(req.params.codigo || '').trim().toUpperCase()
+    if (!/^VEN-[A-F0-9]{8}$/.test(codigo)) {
+      return res.status(400).json({ message: 'Código da venda inválido.' })
+    }
+    const venda = await operations.getVenda(codigo)
+    if (!venda) return res.status(404).json({ message: 'Venda não encontrada.' })
+    return res.status(200).json(toPublicSale(venda))
   })
 
   app.post('/api/vendas/reservar', async (req, res) => {
@@ -91,90 +98,73 @@ const createApp = ({
       return res.status(400).json({ message: 'Informe uma placa e um CPF válidos.' })
     }
 
-    const cliente = await requestService(clientesBaseUrl, `/internal/clientes/${encodeURIComponent(cpf)}`)
-    const veiculo = await requestService(veiculosBaseUrl, `/internal/veiculos/${encodeURIComponent(placa)}`)
-    if (veiculo.status !== 'DISPONIVEL') {
-      return res.status(409).json({ message: 'Veículo não está disponível para venda.' })
-    }
-
-    const [active] = await db.execute(
-      "SELECT codigo FROM vendas WHERE veiculo_placa = ? AND status = 'AGUARDANDO_PAGAMENTO' LIMIT 1",
-      [placa]
-    )
-    if (active.length) return res.status(409).json({ message: 'Este veículo já possui uma reserva ativa.' })
-
-    await requestService(veiculosBaseUrl, `/internal/veiculos/${encodeURIComponent(placa)}/status`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ status: 'RESERVADO' })
-    })
-
     const codigo = generateCode()
+    await db.execute(
+      `INSERT INTO vendas (codigo, veiculo_placa, cliente_cpf, status)
+       VALUES (?, ?, ?, 'RESERVA_PROCESSANDO')`,
+      [codigo, placa, cpf]
+    )
+
     try {
-      await db.execute(
-        'INSERT INTO vendas (codigo, veiculo_id, veiculo_placa, cliente_id, cliente_cpf, preco, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [codigo, veiculo.id, placa, cliente.id, cpf, veiculo.preco, 'AGUARDANDO_PAGAMENTO']
-      )
+      await enqueueOperation('RESERVAR_VEICULO', codigo)
     } catch (error) {
       try {
-        await requestService(veiculosBaseUrl, `/internal/veiculos/${encodeURIComponent(placa)}/status`, {
-          method: 'PATCH',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ status: 'DISPONIVEL' })
-        })
-      } catch (compensationError) {
-        console.error('Falha ao liberar veículo após erro ao criar venda:', compensationError)
+        await db.execute(
+          `UPDATE vendas SET status = 'RESERVA_FALHOU', last_error = ?
+           WHERE codigo = ? AND status = 'RESERVA_PROCESSANDO'`,
+          ['Não foi possível iniciar a reserva.', codigo]
+        )
+      } catch (updateError) {
+        console.error('Falha ao registrar erro ao enfileirar a reserva:', updateError)
       }
       throw error
     }
 
-    const venda = await getVenda(codigo)
-    return res.status(201).json({
+    const venda = await operations.getVenda(codigo)
+    return res.status(202).json({
       ...toPublicSale(venda),
-      veiculo: { ...veiculo, status: 'RESERVADO' },
-      cliente: { nome: cliente.nome, cpf: cliente.cpf, email: cliente.email }
+      statusUrl: `/api/vendas/${codigo}`
     })
   })
 
-  const changeSaleState = async (req, res, status, vehicleStatus) => {
+  const changeSaleState = async (req, res) => {
     const codigo = String(req.params.codigo || '').trim().toUpperCase()
     if (!/^VEN-[A-F0-9]{8}$/.test(codigo)) {
       return res.status(400).json({ message: 'Código da venda inválido.' })
     }
-    const venda = await getVenda(codigo)
+    const venda = await operations.getVenda(codigo)
     if (!venda) return res.status(404).json({ message: 'Venda não encontrada.' })
     if (venda.status === 'CANCELADA') {
-      return res.status(409).json({ message: status === 'CANCELADA'
-        ? 'Venda já cancelada.'
-        : 'Não é possível confirmar pagamento de uma venda cancelada.' })
+      return res.status(409).json({ message: 'Venda já cancelada.' })
     }
     if (venda.status === 'PAGAMENTO_CONFIRMADO') {
-      return res.status(409).json({ message: status === 'CANCELADA'
-        ? 'Não é possível cancelar uma venda já confirmada.'
-        : 'Pagamento já confirmado para esta venda.' })
+      return res.status(409).json({ message: 'Não é possível cancelar uma venda já confirmada.' })
+    }
+    if (!['AGUARDANDO_PAGAMENTO', 'PAGAMENTO_FALHOU'].includes(venda.status)) {
+      return res.status(409).json({ message: 'A venda não pode ser cancelada enquanto está sendo processada.' })
     }
 
     const [result] = await db.execute(
-      "UPDATE vendas SET status = ? WHERE codigo = ? AND status = 'AGUARDANDO_PAGAMENTO'",
-      [status, codigo]
+      'UPDATE vendas SET status = ?, last_error = NULL WHERE codigo = ? AND status = ?',
+      ['CANCELADA', codigo, venda.status]
     )
     if (!result.affectedRows) return res.status(409).json({ message: 'A venda foi alterada por outra operação.' })
 
     try {
-      await requestService(
+      await operations.requestService(
         veiculosBaseUrl,
         `/internal/veiculos/${encodeURIComponent(venda.veiculo_placa)}/status`,
         {
           method: 'PATCH',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ status: vehicleStatus })
+          body: JSON.stringify({ status: 'DISPONIVEL' })
         }
       )
     } catch (error) {
       try {
         await db.execute(
-          "UPDATE vendas SET status = 'AGUARDANDO_PAGAMENTO' WHERE codigo = ? AND status = ?",
-          [codigo, status]
+          'UPDATE vendas SET status = ?, last_error = NULL WHERE codigo = ? AND status = ?',
+          [venda.status, codigo, 'CANCELADA']
         )
       } catch (compensationError) {
         console.error('Falha ao reverter status da venda após erro na API de veículos:', compensationError)
@@ -182,14 +172,57 @@ const createApp = ({
       throw error
     }
 
-    const vendaAtualizada = await getVenda(codigo)
+    const vendaAtualizada = await operations.getVenda(codigo)
     return res.status(200).json(toPublicSale(vendaAtualizada))
   }
 
-  app.post('/api/vendas/:codigo/cancelar', async (req, res) =>
-    changeSaleState(req, res, 'CANCELADA', 'DISPONIVEL'))
-  app.post('/api/vendas/:codigo/confirmar-pagamento', async (req, res) =>
-    changeSaleState(req, res, 'PAGAMENTO_CONFIRMADO', 'VENDIDO'))
+  app.post('/api/vendas/:codigo/cancelar', changeSaleState)
+  app.post('/api/vendas/:codigo/confirmar-pagamento', async (req, res) => {
+    const codigo = String(req.params.codigo || '').trim().toUpperCase()
+    if (!/^VEN-[A-F0-9]{8}$/.test(codigo)) {
+      return res.status(400).json({ message: 'Código da venda inválido.' })
+    }
+    const venda = await operations.getVenda(codigo)
+    if (!venda) return res.status(404).json({ message: 'Venda não encontrada.' })
+    if (venda.status === 'CANCELADA') {
+      return res.status(409).json({ message: 'Não é possível confirmar pagamento de uma venda cancelada.' })
+    }
+    if (venda.status === 'PAGAMENTO_CONFIRMADO') {
+      return res.status(409).json({ message: 'Pagamento já confirmado para esta venda.' })
+    }
+    if (venda.status === 'PAGAMENTO_PROCESSANDO') {
+      return res.status(409).json({ message: 'A confirmação do pagamento já está em processamento.' })
+    }
+    if (!['AGUARDANDO_PAGAMENTO', 'PAGAMENTO_FALHOU'].includes(venda.status)) {
+      return res.status(409).json({ message: 'A reserva ainda não está pronta para confirmação do pagamento.' })
+    }
+
+    const [result] = await db.execute(
+      'UPDATE vendas SET status = ?, last_error = NULL WHERE codigo = ? AND status = ?',
+      ['PAGAMENTO_PROCESSANDO', codigo, venda.status]
+    )
+    if (!result.affectedRows) return res.status(409).json({ message: 'A venda foi alterada por outra operação.' })
+
+    try {
+      await enqueueOperation('CONFIRMAR_PAGAMENTO', codigo)
+    } catch (error) {
+      try {
+        await db.execute(
+          'UPDATE vendas SET status = ? WHERE codigo = ? AND status = ?',
+          [venda.status, codigo, 'PAGAMENTO_PROCESSANDO']
+        )
+      } catch (updateError) {
+        console.error('Falha ao restaurar a venda após erro ao enfileirar o pagamento:', updateError)
+      }
+      throw error
+    }
+
+    const vendaAtualizada = await operations.getVenda(codigo)
+    return res.status(202).json({
+      ...toPublicSale(vendaAtualizada),
+      statusUrl: `/api/vendas/${codigo}`
+    })
+  })
 
   app.use((error, req, res, next) => {
     if (error?.code === 'ER_DUP_ENTRY') {

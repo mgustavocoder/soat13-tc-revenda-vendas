@@ -10,9 +10,11 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "worker": "node src/worker.js"
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1169.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
